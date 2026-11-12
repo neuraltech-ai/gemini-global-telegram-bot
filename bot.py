@@ -4,24 +4,37 @@ import io
 import logging
 import os
 import time
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.enums import ChatAction, ParseMode
 from aiogram.filters import Command, CommandStart
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup
 from google import genai
 from google.genai import types as genai_types
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "ضع_مفتاح_تيليجرام_هنا")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "ضع_مفتاح_جيميني_هنا")
+# ==========================================
+# 1. إعداد المفاتيح وتنظيف المسافات الزائدة تلقائياً
+# ==========================================
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "ضع_مفتاح_تيليجرام_هنا").strip()
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "ضع_مفتاح_جيميني_هنا").strip()
 PORT = int(os.getenv("PORT", "8080"))
 
 MAX_CONCURRENT_REQUESTS = 50
-MAX_HISTORY_MESSAGES = 12
-RATE_LIMIT_SECONDS = 1.5
+MAX_HISTORY_MESSAGES = 10
+RATE_LIMIT_SECONDS = 1.0
 
+# سلسلة النماذج الاحتياطية لضمان عدم توقف البوت أبداً
+FALLBACK_MODELS = [
+    "gemini-2.5-flash",
+    "gemini-2.0-flash",
+    "gemini-1.5-flash",
+]
+
+# ==========================================
+# 2. أنماط الذكاء الاصطناعي (AI Personas & Modes)
+# ==========================================
 MODES = {
     "fast": {
         "name": "⚡ السريع والذكي (Flash)",
@@ -32,7 +45,7 @@ MODES = {
             "أنت مساعد ذكي عالمي فائق السرعة والدقة تعمل داخل تيليجرام.\n"
             "القواعد الصارمة:\n"
             "1. أجب بلغة المستخدم (العربية، الفرنسية، أو الإنجليزية) بأسلوب منظم وواضح باستخدام النقاط والرموز التعبيرية المناسبة.\n"
-            "2. الدقة المتناهية: اعتمد على الحقائق المؤكدة ونتائج البحث، وإذا لم تتوفر معلومة مؤكدة قل بوضوح 'لا أملك معلومة مؤكدة حول هذا الأمر' دون تخمين.\n"
+            "2. الدقة المتناهية: اعتمد على الحقائق المؤكدة، وإذا لم تتوفر معلومة مؤكدة قل بوضوح 'لا أملك معلومة مؤكدة حول هذا الأمر' دون تخمين.\n"
             "3. اجعل الإجابات مباشرة، غنية بالمعلومات، ومثالية للقراءة على شاشة الهاتف."
         ),
     },
@@ -63,7 +76,7 @@ MODES = {
     },
     "coder": {
         "name": "💻 خبير البرمجة",
-        "model": "gemini-2.5-pro",
+        "model": "gemini-2.5-flash",
         "temp": 0.1,
         "search": False,
         "instruction": (
@@ -75,6 +88,9 @@ MODES = {
     },
 }
 
+# ==========================================
+# 3. إدارة حالة المستخدمين والذاكرة الآمنة
+# ==========================================
 class UserSessionManager:
     def __init__(self):
         self.histories: Dict[int, deque] = defaultdict(
@@ -84,20 +100,35 @@ class UserSessionManager:
         self.last_request_time: Dict[int, float] = defaultdict(float)
         self.last_bot_reply: Dict[int, str] = {}
 
-    def add_message(self, user_id: int, role: str, text: str):
+    def add_exchange(self, user_id: int, user_text: str, model_text: str):
+        """إضافة السؤال والجواب معاً لضمان تناوب الأدوار (user/model) وعدم حدوث خطأ في Gemini API."""
         self.histories[user_id].append(
             genai_types.Content(
-                role=role,
-                parts=[genai_types.Part.from_text(text=text)],
+                role="user",
+                parts=[genai_types.Part.from_text(text=user_text)],
+            )
+        )
+        self.histories[user_id].append(
+            genai_types.Content(
+                role="model",
+                parts=[genai_types.Part.from_text(text=model_text)],
             )
         )
 
-    def get_history(self, user_id: int) -> List[genai_types.Content]:
-        return list(self.histories[user_id])
+    def build_contents(self, user_id: int, current_user_text: str) -> List[genai_types.Content]:
+        history_list = list(self.histories[user_id])
+        history_list.append(
+            genai_types.Content(
+                role="user",
+                parts=[genai_types.Part.from_text(text=current_user_text)],
+            )
+        )
+        return history_list
 
     def clear_history(self, user_id: int):
         self.histories[user_id].clear()
         self.last_bot_reply.pop(user_id, None)
+
 
 sessions = UserSessionManager()
 concurrency_semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
@@ -106,6 +137,72 @@ ai_client = genai.Client(api_key=GEMINI_API_KEY)
 bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher()
 
+# ==========================================
+# 4. محرك الذكاء المتسامح مع الأخطاء (Smart Fallback Engine)
+# ==========================================
+async def generate_smart_response(
+    contents,
+    mode_key: str,
+    allow_search: bool = True,
+) -> str:
+    """
+    يحاول التوليد باستخدام النموذج المختار مع البحث، وفي حال وجود قيود على الحصة المجانية
+    أو أداة البحث ينتقل تلقائياً وبسرعة إلى النماذج الاحتياطية دون إظهار خطأ للمستخدم.
+    """
+    mode = MODES.get(mode_key, MODES["fast"])
+    primary_model = mode["model"]
+
+    candidate_models = [primary_model] + [
+        m for m in FALLBACK_MODELS if m != primary_model
+    ]
+
+    last_error: Optional[Exception] = None
+
+    for model_name in candidate_models:
+        # المحاولة الأولى: مع تفعيل بحث جوجل (إذا كان مفعلاً في الوضع)
+        if allow_search and mode["search"]:
+            try:
+                config = genai_types.GenerateContentConfig(
+                    system_instruction=mode["instruction"],
+                    temperature=mode["temp"],
+                    tools=[{"google_search": {}}],
+                )
+                response = await ai_client.aio.models.generate_content(
+                    model=model_name,
+                    contents=contents,
+                    config=config,
+                )
+                if response and response.text:
+                    return response.text
+            except Exception as e:
+                logging.warning(
+                    f"Model {model_name} with search failed ({e}), retrying without search..."
+                )
+                last_error = e
+
+        # المحاولة الثانية: بدون أداة البحث لضمان أقصى توافق وسرعة
+        try:
+            config = genai_types.GenerateContentConfig(
+                system_instruction=mode["instruction"],
+                temperature=mode["temp"],
+            )
+            response = await ai_client.aio.models.generate_content(
+                model=model_name,
+                contents=contents,
+                config=config,
+            )
+            if response and response.text:
+                return response.text
+        except Exception as e:
+            logging.warning(f"Model {model_name} without search failed: {e}")
+            last_error = e
+
+    raise RuntimeError(f"All models failed. Last error: {last_error}")
+
+
+# ==========================================
+# 5. لوحات المفاتيح التفاعلية (Inline Keyboards)
+# ==========================================
 def get_main_menu_keyboard(user_id: int) -> InlineKeyboardMarkup:
     current_mode = sessions.user_modes[user_id]
     buttons = []
@@ -136,6 +233,7 @@ def get_main_menu_keyboard(user_id: int) -> InlineKeyboardMarkup:
     )
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
+
 def get_response_actions_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -160,6 +258,7 @@ def get_response_actions_keyboard() -> InlineKeyboardMarkup:
             ],
         ]
     )
+
 
 async def safe_send_or_edit(
     message: types.Message,
@@ -190,16 +289,12 @@ async def safe_send_or_edit(
             else:
                 await message.answer(chunk, parse_mode=None, reply_markup=markup)
 
-def build_genai_config(mode_key: str) -> genai_types.GenerateContentConfig:
-    mode = MODES.get(mode_key, MODES["fast"])
-    tools = [{"google_search": {}}] if mode["search"] else None
-    return genai_types.GenerateContentConfig(
-        system_instruction=mode["instruction"],
-        temperature=mode["temp"],
-        tools=tools,
-    )
 
+# ==========================================
+# 6. معالجة الأوامر (بما فيها command1/2/3 التلقائية)
+# ==========================================
 @dp.message(CommandStart())
+@dp.message(Command("command1"))
 async def cmd_start(message: types.Message):
     user_id = message.from_user.id
     mode_name = MODES[sessions.user_modes[user_id]]["name"]
@@ -218,14 +313,8 @@ async def cmd_start(message: types.Message):
         message, welcome_text, reply_markup=get_main_menu_keyboard(user_id)
     )
 
-@dp.message(Command("clear", "reset"))
-async def cmd_clear(message: types.Message):
-    sessions.clear_history(message.from_user.id)
-    await message.answer(
-        "✨ تم مسح ذاكرة المحادثة بنجاح! يمكنك البدء في موضوع جديد الآن."
-    )
 
-@dp.message(Command("mode", "settings"))
+@dp.message(Command("mode", "settings", "command2"))
 async def cmd_mode(message: types.Message):
     user_id = message.from_user.id
     await message.answer(
@@ -233,6 +322,37 @@ async def cmd_mode(message: types.Message):
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=get_main_menu_keyboard(user_id),
     )
+
+
+@dp.message(Command("clear", "reset", "command3"))
+async def cmd_clear(message: types.Message):
+    sessions.clear_history(message.from_user.id)
+    await message.answer(
+        "✨ تم مسح ذاكرة المحادثة بنجاح! يمكنك البدء في موضوع جديد الآن."
+    )
+
+
+@dp.message(Command("status", "debug", "command4"))
+async def cmd_status(message: types.Message):
+    status_msg = await message.answer("📡 جاري فحص الاتصال بمحرك الذكاء الاصطناعي...")
+    try:
+        reply = await generate_smart_response(
+            contents="أجب بكلمة واحدة فقط: متصل",
+            mode_key="fast",
+            allow_search=False,
+        )
+        await status_msg.edit_text(
+            f"✅ **حالة النظام ممتازة!**\n"
+            f"• الاتصال بـ Gemini API: `نشط ({reply.strip()})`\n"
+            f"• الوضع الحالي: `{MODES[sessions.user_modes[message.from_user.id]]['name']}`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+    except Exception as e:
+        await status_msg.edit_text(
+            f"⚠️ **تفاصيل الخطأ التقني في المفتاح أو الخدمة:**\n`{str(e)[:300]}`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+
 
 @dp.callback_query(F.data.startswith("mode:"))
 async def handle_mode_switch(callback: types.CallbackQuery):
@@ -245,6 +365,7 @@ async def handle_mode_switch(callback: types.CallbackQuery):
         await callback.message.edit_reply_markup(
             reply_markup=get_main_menu_keyboard(user_id)
         )
+
 
 @dp.callback_query(F.data.startswith("action:"))
 async def handle_action_buttons(callback: types.CallbackQuery):
@@ -270,15 +391,17 @@ async def handle_action_buttons(callback: types.CallbackQuery):
         help_text = (
             "🚀 **مميزات البوت الاحترافية:**\n\n"
             "1. **تعدد المستخدمين الفوري (Async Concurrency):** يدعم عشرات المستخدمين في نفس الثانية بذاكرة مستقلة لكل مستخدم.\n"
-            "2. **البث الحي للإجابات (Live Streaming):** تظهر الإجابة تدريجياً بسرعة فائقة دون انتظار طويل.\n"
+            "2. **الانتقال الذكي بين النماذج (Auto-Fallback):** يضمن استمرار الردود بأقصى سرعة ودقة.\n"
             "3. **دعم الوسائط المتعددة (Multimodal):** يقرأ الصور، ملفات PDF، والرسائل الصوتية.\n"
             "4. **متصل بمحرك البحث (Google Search Grounding):** للوصول لأحدث المعلومات الموثقة.\n\n"
             "📌 **الأوامر السريعة:**\n"
             "`/start` - القائمة الرئيسية\n"
             "`/mode` - تغيير وضع الذكاء\n"
-            "`/clear` - مسح ذاكرة الحوار"
+            "`/clear` - مسح ذاكرة الحوار\n"
+            "`/status` - فحص حالة النظام"
         )
         await safe_send_or_edit(callback.message, help_text)
+
 
 @dp.callback_query(F.data.startswith("quick:"))
 async def handle_quick_followup(callback: types.CallbackQuery):
@@ -299,17 +422,18 @@ async def handle_quick_followup(callback: types.CallbackQuery):
     }
 
     await callback.answer("جاري المعالجة الفورية... ⚡")
-    status_msg = await callback.message.answer("⏳ *جاري تنفيذ طلبك...*", parse_mode=ParseMode.MARKDOWN)
+    status_msg = await callback.message.answer(
+        "⏳ *جاري تنفيذ طلبك...*", parse_mode=ParseMode.MARKDOWN
+    )
 
     mode_key = sessions.user_modes[user_id]
     try:
         async with concurrency_semaphore:
-            response = await ai_client.aio.models.generate_content(
-                model=MODES[mode_key]["model"],
+            reply_text = await generate_smart_response(
                 contents=prompts[q_type],
-                config=build_genai_config(mode_key),
+                mode_key=mode_key,
+                allow_search=False,
             )
-            reply_text = response.text or "لم أتمكن من المعالجة."
             sessions.last_bot_reply[user_id] = reply_text
             await safe_send_or_edit(
                 status_msg,
@@ -321,6 +445,10 @@ async def handle_quick_followup(callback: types.CallbackQuery):
         logging.error(f"Quick Action Error: {e}")
         await status_msg.edit_text("⚠️ حدث خطأ مؤقت أثناء المعالجة، يرجى المحاولة لاحقاً.")
 
+
+# ==========================================
+# 7. معالجة الوسائط المتعددة (صور، ملفات PDF، صوتيات)
+# ==========================================
 @dp.message(F.photo | F.document | F.voice | F.audio)
 async def handle_multimodal(message: types.Message):
     user_id = message.from_user.id
@@ -370,15 +498,13 @@ async def handle_multimodal(message: types.Message):
         ]
 
         async with concurrency_semaphore:
-            response = await ai_client.aio.models.generate_content(
-                model=MODES[mode_key]["model"],
+            reply_text = await generate_smart_response(
                 contents=contents,
-                config=build_genai_config(mode_key),
+                mode_key=mode_key,
+                allow_search=False,
             )
 
-        reply_text = response.text or "لم أتمكن من استخراج نص من المرفق."
-        sessions.add_message(user_id, "user", f"[مرفق: {user_caption}]")
-        sessions.add_message(user_id, "model", reply_text)
+        sessions.add_exchange(user_id, f"[ملف مرفق: {user_caption}]", reply_text)
         sessions.last_bot_reply[user_id] = reply_text
 
         await safe_send_or_edit(
@@ -391,9 +517,14 @@ async def handle_multimodal(message: types.Message):
     except Exception as e:
         logging.error(f"Multimodal Error: {e}")
         await status_msg.edit_text(
-            "⚠️ تعذر تحليل الملف المرفق حالياً. تأكد من أن حجم الملف مناسب وحاول مجدداً."
+            "⚠️ تعذر تحليل الملف المرفق حالياً. يرجى التأكد من صلاحية مفتاح `GEMINI_API_KEY` عبر الأمر `/status`.",
+            parse_mode=ParseMode.MARKDOWN,
         )
 
+
+# ==========================================
+# 8. معالجة النصوص مع الانتقال الذكي بين النماذج
+# ==========================================
 @dp.message(F.text)
 async def handle_text_message(message: types.Message):
     user_id = message.from_user.id
@@ -401,46 +532,27 @@ async def handle_text_message(message: types.Message):
 
     now = time.time()
     if now - sessions.last_request_time[user_id] < RATE_LIMIT_SECONDS:
-        await message.answer("⚡ أرسل رسائلك بهدوء، جاري معالجة طلبك السابق...")
+        await message.answer("⚡ جاري معالجة طلبك السابق، لحظة من فضلك...")
         return
     sessions.last_request_time[user_id] = now
 
     await bot.send_chat_action(chat_id=message.chat.id, action=ChatAction.TYPING)
-    status_msg = await message.answer("💭 *جاري التفكير...*", parse_mode=ParseMode.MARKDOWN)
+    status_msg = await message.answer(
+        "💭 *جاري التفكير...*", parse_mode=ParseMode.MARKDOWN
+    )
 
     mode_key = sessions.user_modes[user_id]
-    model_name = MODES[mode_key]["model"]
-
-    sessions.add_message(user_id, "user", user_text)
-    conversation_contents = sessions.get_history(user_id)
+    conversation_contents = sessions.build_contents(user_id, user_text)
 
     try:
         async with concurrency_semaphore:
-            stream = await ai_client.aio.models.generate_content_stream(
-                model=model_name,
+            full_text = await generate_smart_response(
                 contents=conversation_contents,
-                config=build_genai_config(mode_key),
+                mode_key=mode_key,
+                allow_search=True,
             )
 
-            full_text = ""
-            last_edit_time = time.time()
-
-            async for chunk in stream:
-                if chunk.text:
-                    full_text += chunk.text
-                    if time.time() - last_edit_time >= 1.2 and len(full_text) < 3900:
-                        try:
-                            await status_msg.edit_text(
-                                full_text + " ▌", parse_mode=None
-                            )
-                            last_edit_time = time.time()
-                        except Exception:
-                            pass
-
-            if not full_text:
-                full_text = "لا أملك معلومة مؤكدة حول هذا الأمر."
-
-            sessions.add_message(user_id, "model", full_text)
+            sessions.add_exchange(user_id, user_text, full_text)
             sessions.last_bot_reply[user_id] = full_text
 
             await safe_send_or_edit(
@@ -453,18 +565,24 @@ async def handle_text_message(message: types.Message):
     except Exception as e:
         logging.error(f"Text Generation Error for user {user_id}: {e}")
         await status_msg.edit_text(
-            "⏳ عذراً، يواجه الخادم ضغطاً كبيراً في الطلبات حالياً أو حدث خطأ مؤقت.\n"
-            "يرجى المحاولة مرة أخرى بعد لحظات."
+            "⏳ عذراً، تعذر الاتصال بمحرك الذكاء الاصطناعي.\n"
+            "اضغط على `/status` لفحص مفتاح `GEMINI_API_KEY` في إعدادات Render.",
+            parse_mode=ParseMode.MARKDOWN,
         )
 
+
+# ==========================================
+# 9. خادم الويب المدمج (Keep-Alive Server لـ Render)
+# ==========================================
 async def health_check(request: web.Request) -> web.Response:
     return web.json_response(
         {
             "status": "online",
-            "service": "Global Gemini Telegram Bot",
+            "service": "NeuralTech AI Global Telegram Bot",
             "active_users_in_memory": len(sessions.histories),
         }
     )
+
 
 async def start_web_server():
     app = web.Application()
@@ -476,14 +594,35 @@ async def start_web_server():
     await site.start()
     logging.info(f"🌐 خادم الويب يعمل بنجاح على المنفذ {PORT} (Render Ready)")
 
+
+async def setup_bot_commands():
+    """تحديث قائمة أوامر البوت تلقائياً في تيليجرام لإلغاء command1 و command2."""
+    commands = [
+        BotCommand(command="start", description="🚀 القائمة الرئيسية وبدء المحادثة"),
+        BotCommand(command="mode", description="⚙️ تغيير وضع الذكاء الاصطناعي"),
+        BotCommand(command="clear", description="🗑️ مسح الذاكرة وبدء حوار جديد"),
+        BotCommand(command="status", description="📡 فحص حالة الاتصال والخادم"),
+    ]
+    try:
+        await bot.set_my_commands(commands)
+        logging.info("✅ تم تحديث قائمة أوامر البوت (Menu) تلقائياً!")
+    except Exception as e:
+        logging.warning(f"Could not set bot commands: {e}")
+
+
+# ==========================================
+# 10. نقطة التشغيل الرئيسية
+# ==========================================
 async def main():
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s - %(levelname)s - %(message)s",
     )
     await start_web_server()
+    await setup_bot_commands()
     logging.info("🚀 البوت العالمي يعمل الآن بنجاح وجاهز لاستقبال المستخدمين!")
     await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+
 
 if __name__ == "__main__":
     asyncio.run(main())
