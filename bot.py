@@ -4,7 +4,11 @@ import io
 import logging
 import os
 import time
-from typing import Dict, List, Optional
+from typing import Dict, List
+
+# إجبار مكتبة google-genai (الإصدار 3+) على استخدام واجهة v1beta التي تدعم
+# جميع نماذج Gemini الحديثة وخاصية system_instruction والبحث المباشر
+os.environ["GOOGLE_GENAI_API_VERSION"] = "v1beta"
 
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F, types
@@ -25,12 +29,16 @@ MAX_CONCURRENT_REQUESTS = 50
 MAX_HISTORY_MESSAGES = 10
 RATE_LIMIT_SECONDS = 1.0
 
-# سلسلة النماذج الاحتياطية لضمان عدم توقف البوت أبداً
+# النماذج الحديثة المعتمدة في واجهة v1beta (بدون gemini-1.5-flash المتوقف)
 FALLBACK_MODELS = [
     "gemini-2.5-flash",
+    "gemini-flash-latest",
+    "gemini-2.5-flash-lite",
     "gemini-2.0-flash",
-    "gemini-1.5-flash",
 ]
+
+# قائمة النماذج المكتشفة تلقائياً من حساب المستخدم عند التشغيل
+DISCOVERED_MODELS: List[str] = []
 
 # ==========================================
 # 2. أنماط الذكاء الاصطناعي (AI Personas & Modes)
@@ -68,10 +76,10 @@ MODES = {
         "temp": 0.25,
         "search": True,
         "instruction": (
-            "أنت أستاذ ومعلم خبير في البيداغوجيا والتدريس الصريح وتبسيط العلوم.\n"
+            "أنت أستاذ ومعلم خبير في البيداغوجيا والتدريس الصريح وتبسيط العلوم والرياضيات.\n"
             "القواعد الصارمة:\n"
             "1. اشرح المفاهيم خطوة بخطوة بأسلوب سلس يناسب المتعلم، مع تقديم أمثلة تطبيقية واضحة.\n"
-            "2. عند حل المسائل الرياضية أو العلمية، اعرض خطوات البرهان والحل بالتفصيل المنهجي."
+            "2. عند حل المسائل الرياضية أو العلمية (بالعربية أو الفرنسية)، اعرض خطوات البرهان والحل بالتفصيل المنهجي."
         ),
     },
     "coder": {
@@ -101,7 +109,6 @@ class UserSessionManager:
         self.last_bot_reply: Dict[int, str] = {}
 
     def add_exchange(self, user_id: int, user_text: str, model_text: str):
-        """إضافة السؤال والجواب معاً لضمان تناوب الأدوار (user/model) وعدم حدوث خطأ في Gemini API."""
         self.histories[user_id].append(
             genai_types.Content(
                 role="user",
@@ -115,7 +122,9 @@ class UserSessionManager:
             )
         )
 
-    def build_contents(self, user_id: int, current_user_text: str) -> List[genai_types.Content]:
+    def build_contents(
+        self, user_id: int, current_user_text: str
+    ) -> List[genai_types.Content]:
         history_list = list(self.histories[user_id])
         history_list.append(
             genai_types.Content(
@@ -133,33 +142,66 @@ class UserSessionManager:
 sessions = UserSessionManager()
 concurrency_semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
 
-ai_client = genai.Client(api_key=GEMINI_API_KEY)
+# تهيئة عميل Gemini مع فرض استخدام v1beta لضمان عمل كافة النماذج والخصائص
+ai_client = genai.Client(
+    api_key=GEMINI_API_KEY,
+    http_options={"api_version": "v1beta"},
+)
 bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher()
 
+
 # ==========================================
-# 4. محرك الذكاء المتسامح مع الأخطاء (Smart Fallback Engine)
+# 4. الاكتشاف التلقائي للنماذج المتاحة في حساب المستخدم
+# ==========================================
+async def discover_available_models():
+    """فحص النماذج المتاحة فعلياً لمفتاح API الخاص بالمستخدم لتجنب خطأ 404 نهائياً."""
+    global DISCOVERED_MODELS
+    try:
+        models_found = []
+        for m in ai_client.models.list():
+            name = getattr(m, "name", "") or ""
+            if name.startswith("models/"):
+                name = name.replace("models/", "", 1)
+            actions = getattr(m, "supported_actions", []) or []
+            if "gemini" in name.lower() and "embedding" not in name.lower():
+                if not actions or "generateContent" in actions:
+                    models_found.append(name)
+        if models_found:
+            DISCOVERED_MODELS = models_found
+            logging.info(f"✅ النماذج المكتشفة في الحساب: {DISCOVERED_MODELS[:6]}")
+    except Exception as e:
+        logging.warning(f"Model discovery warning: {e}")
+
+
+def get_candidate_models(primary_model: str) -> List[str]:
+    candidates = [primary_model]
+    for m in FALLBACK_MODELS:
+        if m not in candidates:
+            candidates.append(m)
+    for m in DISCOVERED_MODELS:
+        if "flash" in m and m not in candidates:
+            candidates.append(m)
+    for m in DISCOVERED_MODELS:
+        if m not in candidates:
+            candidates.append(m)
+    return candidates[:6]
+
+
+# ==========================================
+# 5. محرك الذكاء المتسامح مع الأخطاء (Smart Fallback Engine)
 # ==========================================
 async def generate_smart_response(
     contents,
     mode_key: str,
     allow_search: bool = True,
 ) -> str:
-    """
-    يحاول التوليد باستخدام النموذج المختار مع البحث، وفي حال وجود قيود على الحصة المجانية
-    أو أداة البحث ينتقل تلقائياً وبسرعة إلى النماذج الاحتياطية دون إظهار خطأ للمستخدم.
-    """
     mode = MODES.get(mode_key, MODES["fast"])
-    primary_model = mode["model"]
+    candidates = get_candidate_models(mode["model"])
+    errors_log = []
 
-    candidate_models = [primary_model] + [
-        m for m in FALLBACK_MODELS if m != primary_model
-    ]
-
-    last_error: Optional[Exception] = None
-
-    for model_name in candidate_models:
-        # المحاولة الأولى: مع تفعيل بحث جوجل (إذا كان مفعلاً في الوضع)
+    for model_name in candidates:
+        # المحاولة 1: مع البحث المباشر في جوجل
         if allow_search and mode["search"]:
             try:
                 config = genai_types.GenerateContentConfig(
@@ -175,12 +217,9 @@ async def generate_smart_response(
                 if response and response.text:
                     return response.text
             except Exception as e:
-                logging.warning(
-                    f"Model {model_name} with search failed ({e}), retrying without search..."
-                )
-                last_error = e
+                logging.warning(f"[{model_name} + search] failed: {e}")
 
-        # المحاولة الثانية: بدون أداة البحث لضمان أقصى توافق وسرعة
+        # المحاولة 2: بدون أداة البحث لضمان السرعة وتفادي قيود الحصة المجانية
         try:
             config = genai_types.GenerateContentConfig(
                 system_instruction=mode["instruction"],
@@ -194,14 +233,15 @@ async def generate_smart_response(
             if response and response.text:
                 return response.text
         except Exception as e:
-            logging.warning(f"Model {model_name} without search failed: {e}")
-            last_error = e
+            err_msg = f"{model_name}: {str(e)[:120]}"
+            logging.warning(f"[{model_name} standard] failed: {e}")
+            errors_log.append(err_msg)
 
-    raise RuntimeError(f"All models failed. Last error: {last_error}")
+    raise RuntimeError(" | ".join(errors_log[:3]))
 
 
 # ==========================================
-# 5. لوحات المفاتيح التفاعلية (Inline Keyboards)
+# 6. لوحات المفاتيح التفاعلية (Inline Keyboards)
 # ==========================================
 def get_main_menu_keyboard(user_id: int) -> InlineKeyboardMarkup:
     current_mode = sessions.user_modes[user_id]
@@ -291,7 +331,7 @@ async def safe_send_or_edit(
 
 
 # ==========================================
-# 6. معالجة الأوامر (بما فيها command1/2/3 التلقائية)
+# 7. معالجة الأوامر
 # ==========================================
 @dp.message(CommandStart())
 @dp.message(Command("command1"))
@@ -336,20 +376,24 @@ async def cmd_clear(message: types.Message):
 async def cmd_status(message: types.Message):
     status_msg = await message.answer("📡 جاري فحص الاتصال بمحرك الذكاء الاصطناعي...")
     try:
+        if not DISCOVERED_MODELS:
+            await discover_available_models()
         reply = await generate_smart_response(
             contents="أجب بكلمة واحدة فقط: متصل",
             mode_key="fast",
             allow_search=False,
         )
+        models_preview = ", ".join(DISCOVERED_MODELS[:4]) if DISCOVERED_MODELS else "gemini-2.5-flash"
         await status_msg.edit_text(
             f"✅ **حالة النظام ممتازة!**\n"
-            f"• الاتصال بـ Gemini API: `نشط ({reply.strip()})`\n"
+            f"• الاتصال بـ Gemini API (v1beta): `نشط ({reply.strip()})`\n"
+            f"• النماذج المتاحة: `{models_preview}`\n"
             f"• الوضع الحالي: `{MODES[sessions.user_modes[message.from_user.id]]['name']}`",
             parse_mode=ParseMode.MARKDOWN,
         )
     except Exception as e:
         await status_msg.edit_text(
-            f"⚠️ **تفاصيل الخطأ التقني في المفتاح أو الخدمة:**\n`{str(e)[:300]}`",
+            f"⚠️ **تفاصيل الخطأ التقني:**\n`{str(e)[:350]}`",
             parse_mode=ParseMode.MARKDOWN,
         )
 
@@ -391,8 +435,8 @@ async def handle_action_buttons(callback: types.CallbackQuery):
         help_text = (
             "🚀 **مميزات البوت الاحترافية:**\n\n"
             "1. **تعدد المستخدمين الفوري (Async Concurrency):** يدعم عشرات المستخدمين في نفس الثانية بذاكرة مستقلة لكل مستخدم.\n"
-            "2. **الانتقال الذكي بين النماذج (Auto-Fallback):** يضمن استمرار الردود بأقصى سرعة ودقة.\n"
-            "3. **دعم الوسائط المتعددة (Multimodal):** يقرأ الصور، ملفات PDF، والرسائل الصوتية.\n"
+            "2. **الاكتشاف الذكي للنماذج (v1beta Auto-Discovery):** يضمن استمرار الردود بأقصى سرعة ودقة.\n"
+            "3. **دعم الوسائط المتعددة (Multimodal):** يقرأ الصور، التمارين الرياضية، ملفات PDF، والرسائل الصوتية.\n"
             "4. **متصل بمحرك البحث (Google Search Grounding):** للوصول لأحدث المعلومات الموثقة.\n\n"
             "📌 **الأوامر السريعة:**\n"
             "`/start` - القائمة الرئيسية\n"
@@ -447,7 +491,7 @@ async def handle_quick_followup(callback: types.CallbackQuery):
 
 
 # ==========================================
-# 7. معالجة الوسائط المتعددة (صور، ملفات PDF، صوتيات)
+# 8. معالجة الوسائط المتعددة (صور التمارين، ملفات PDF، صوتيات)
 # ==========================================
 @dp.message(F.photo | F.document | F.voice | F.audio)
 async def handle_multimodal(message: types.Message):
@@ -466,7 +510,10 @@ async def handle_multimodal(message: types.Message):
     try:
         file_id = None
         mime_type = "image/jpeg"
-        default_prompt = "قم بتحليل هذه الصورة بدقة واشرح ما فيها أو أجب عن الأسئلة الموجودة بداخلها."
+        default_prompt = (
+            "قم بقراءة وتحليل هذه الصورة بدقة عالية. إذا كانت تحتوي على تمارين أو مسائل رياضية أو علمية، "
+            "فقدّم الحل المفصل والمنهجي خطوة بخطوة لكل سؤال بوضوح تام."
+        )
 
         if message.photo:
             file_id = message.photo[-1].file_id
@@ -474,7 +521,7 @@ async def handle_multimodal(message: types.Message):
         elif message.document:
             file_id = message.document.file_id
             mime_type = message.document.mime_type or "application/pdf"
-            default_prompt = "قم بقراءة هذا المستند وتلخيص أهم النقاط الواردة فيه بدقة."
+            default_prompt = "قم بقراءة هذا المستند وتلخيص أهم النقاط أو حل الأسئلة الواردة فيه بدقة."
         elif message.voice:
             file_id = message.voice.file_id
             mime_type = message.voice.mime_type or "audio/ogg"
@@ -517,13 +564,13 @@ async def handle_multimodal(message: types.Message):
     except Exception as e:
         logging.error(f"Multimodal Error: {e}")
         await status_msg.edit_text(
-            "⚠️ تعذر تحليل الملف المرفق حالياً. يرجى التأكد من صلاحية مفتاح `GEMINI_API_KEY` عبر الأمر `/status`.",
+            f"⚠️ تعذر تحليل الملف المرفق حالياً:\n`{str(e)[:250]}`",
             parse_mode=ParseMode.MARKDOWN,
         )
 
 
 # ==========================================
-# 8. معالجة النصوص مع الانتقال الذكي بين النماذج
+# 9. معالجة النصوص
 # ==========================================
 @dp.message(F.text)
 async def handle_text_message(message: types.Message):
@@ -565,20 +612,21 @@ async def handle_text_message(message: types.Message):
     except Exception as e:
         logging.error(f"Text Generation Error for user {user_id}: {e}")
         await status_msg.edit_text(
-            "⏳ عذراً، تعذر الاتصال بمحرك الذكاء الاصطناعي.\n"
-            "اضغط على `/status` لفحص مفتاح `GEMINI_API_KEY` في إعدادات Render.",
+            f"⏳ عذراً، حدث خطأ أثناء الاتصال بالنموذج:\n`{str(e)[:250]}`",
             parse_mode=ParseMode.MARKDOWN,
         )
 
 
 # ==========================================
-# 9. خادم الويب المدمج (Keep-Alive Server لـ Render)
+# 10. خادم الويب المدمج (Keep-Alive Server لـ Render)
 # ==========================================
 async def health_check(request: web.Request) -> web.Response:
     return web.json_response(
         {
             "status": "online",
             "service": "NeuralTech AI Global Telegram Bot",
+            "api_version": "v1beta",
+            "discovered_models": DISCOVERED_MODELS[:5],
             "active_users_in_memory": len(sessions.histories),
         }
     )
@@ -596,7 +644,6 @@ async def start_web_server():
 
 
 async def setup_bot_commands():
-    """تحديث قائمة أوامر البوت تلقائياً في تيليجرام لإلغاء command1 و command2."""
     commands = [
         BotCommand(command="start", description="🚀 القائمة الرئيسية وبدء المحادثة"),
         BotCommand(command="mode", description="⚙️ تغيير وضع الذكاء الاصطناعي"),
@@ -611,7 +658,7 @@ async def setup_bot_commands():
 
 
 # ==========================================
-# 10. نقطة التشغيل الرئيسية
+# 11. نقطة التشغيل الرئيسية
 # ==========================================
 async def main():
     logging.basicConfig(
@@ -619,6 +666,7 @@ async def main():
         format="%(asctime)s - %(levelname)s - %(message)s",
     )
     await start_web_server()
+    await discover_available_models()
     await setup_bot_commands()
     logging.info("🚀 البوت العالمي يعمل الآن بنجاح وجاهز لاستقبال المستخدمين!")
     await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
